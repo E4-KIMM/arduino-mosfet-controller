@@ -9,17 +9,10 @@
 // ===== 설정 =====
 const uint8_t MOTOR_PIN = 3;
 
-// false: ON/OFF만 사용 (웹 슬라이더 비활성, ON = 100% 출력)
-// true : ON 상태에서 PWM 듀티비(0~100%)로 속도 조절
-const bool ENABLE_SPEED_CONTROL = false;
-
-const uint8_t DEFAULT_SPEED_PCT = 100;
-
 const unsigned long REQUEST_TIMEOUT_MS = 1000;
 
 // ===== 상태 =====
 bool motorOn = false;
-uint8_t speedPct = DEFAULT_SPEED_PCT;
 
 WiFiServer server(80);
 
@@ -35,15 +28,10 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
   #state { font-size: 1.2rem; font-weight: bold; margin-bottom: 20px; }
   #state.on { color: #16a34a; }
   #state.off { color: #dc2626; }
-  .buttons { display: flex; gap: 12px; justify-content: center; margin-bottom: 28px; }
+  .buttons { display: flex; gap: 12px; justify-content: center; }
   button { flex: 1; max-width: 160px; padding: 20px 0; font-size: 1.3rem; font-weight: bold; border: 0; border-radius: 12px; color: #fff; }
   #btnOn { background: #16a34a; }
   #btnOff { background: #dc2626; }
-  .speed { background: #fff; border-radius: 12px; padding: 16px; max-width: 360px; margin: 0 auto; }
-  .speed.disabled { opacity: 0.5; }
-  input[type=range] { width: 100%; }
-  #speedVal { font-size: 1.2rem; font-weight: bold; }
-  #note { font-size: 0.9rem; color: #71717a; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -53,29 +41,12 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
   <button id="btnOn">ON</button>
   <button id="btnOff">OFF</button>
 </div>
-<div class="speed" id="speedBox">
-  <div>속도 <span id="speedVal">-</span>%</div>
-  <input type="range" id="speed" min="0" max="100" step="1">
-  <div id="note"></div>
-</div>
 <script>
   const stateEl = document.getElementById('state');
-  const speedEl = document.getElementById('speed');
-  const speedValEl = document.getElementById('speedVal');
-  const speedBox = document.getElementById('speedBox');
-  const noteEl = document.getElementById('note');
-  let dragging = false;
 
   function render(s) {
     stateEl.textContent = s.on ? 'ON' : 'OFF';
     stateEl.className = s.on ? 'on' : 'off';
-    speedEl.disabled = !s.speedEnabled;
-    speedBox.className = s.speedEnabled ? 'speed' : 'speed disabled';
-    noteEl.textContent = s.speedEnabled ? '' : '속도 제어 비활성화됨 (ON = 100%)';
-    if (!dragging) {
-      speedEl.value = s.speed;
-      speedValEl.textContent = s.speed;
-    }
   }
 
   function call(path) {
@@ -87,8 +58,6 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
 
   document.getElementById('btnOn').onclick = () => call('/on');
   document.getElementById('btnOff').onclick = () => call('/off');
-  speedEl.oninput = () => { dragging = true; speedValEl.textContent = speedEl.value; };
-  speedEl.onchange = () => { dragging = false; call('/speed?v=' + speedEl.value); };
 
   call('/status');
   setInterval(() => call('/status'), 2000);
@@ -99,22 +68,10 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
 
 // 모터 핀 출력은 이 함수에서만 갱신한다.
 void applyOutput() {
-  if (!motorOn) {
-    digitalWrite(MOTOR_PIN, LOW);
-  } else if (!ENABLE_SPEED_CONTROL || speedPct >= 100) {
-    digitalWrite(MOTOR_PIN, HIGH);
-  } else {
-    analogWrite(MOTOR_PIN, map(speedPct, 0, 100, 0, 255));
-  }
+  digitalWrite(MOTOR_PIN, motorOn ? HIGH : LOW);
 
   Serial.print("Motor ");
-  Serial.print(motorOn ? "ON" : "OFF");
-  if (ENABLE_SPEED_CONTROL) {
-    Serial.print(" (speed ");
-    Serial.print(speedPct);
-    Serial.print("%)");
-  }
-  Serial.println();
+  Serial.println(motorOn ? "ON" : "OFF");
 }
 
 void sendStatus(WiFiClient &client) {
@@ -125,10 +82,6 @@ void sendStatus(WiFiClient &client) {
   client.println();
   client.print("{\"on\":");
   client.print(motorOn ? "true" : "false");
-  client.print(",\"speed\":");
-  client.print(ENABLE_SPEED_CONTROL ? speedPct : 100);
-  client.print(",\"speedEnabled\":");
-  client.print(ENABLE_SPEED_CONTROL ? "true" : "false");
   client.println("}");
 }
 
@@ -166,7 +119,6 @@ void handleRequest(WiFiClient &client, const String &requestLine) {
   String target = extractTarget(requestLine);
   int q = target.indexOf('?');
   String path = q >= 0 ? target.substring(0, q) : target;
-  String query = q >= 0 ? target.substring(q + 1) : "";
 
   if (path == "/") {
     sendPage(client);
@@ -177,13 +129,6 @@ void handleRequest(WiFiClient &client, const String &requestLine) {
   } else if (path == "/off") {
     motorOn = false;
     applyOutput();
-    sendStatus(client);
-  } else if (path == "/speed") {
-    int v = query.indexOf("v=");
-    if (ENABLE_SPEED_CONTROL && v >= 0) {
-      speedPct = constrain(query.substring(v + 2).toInt(), 0, 100);
-      applyOutput();
-    }
     sendStatus(client);
   } else if (path == "/status") {
     sendStatus(client);
