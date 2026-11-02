@@ -2,6 +2,8 @@
 //
 // 보드가 WiFi 핫스팟을 만들고, 접속한 브라우저에서 http://192.168.4.1 로 모터 출력(0~100%)을 제어한다.
 // 출력은 PWM duty로 조절한다 (50% ≈ 평균 6V @ 12V 전원).
+// PWM 주파수(기본 150 Hz)와 최대 duty(기본 98%)는 웹에서 조절할 수 있다. 실측 결과 L9110S는 1 kHz 이상에서
+// 스위칭을 못 따라가 모터가 돌지 않고, 100~200 Hz에서 가장 잘 돈다. 최대 duty 캡의 이유는 아래 주석 참고.
 //
 // 배선 (L9110S 채널 A):
 //   D3  → A-IA (PWM)
@@ -12,16 +14,33 @@
 //   Motor A 단자 → 모터
 
 #include <WiFiS3.h>
+#include "pwm.h"
 #include "arduino_secrets.h"
 
 // ===== 설정 =====
 const uint8_t MOTOR_PIN = 3;  // A-IA, PWM
 const uint8_t DIR_PIN = 4;    // A-IB, 실행 중 항상 LOW
 
+// L9110S는 최대 PWM 주파수 스펙이 없다. 실측: 100~200 Hz 정상, 1 kHz 이상은 소리만 나고 모터가 안 돈다.
+const uint32_t DEFAULT_PWM_FREQ_HZ = 150;
+const uint32_t PWM_FREQ_MIN_HZ = 10;
+const uint32_t PWM_FREQ_MAX_HZ = 30000;
+
+// 100% duty는 스위칭 없는 상시 HIGH가 되어, 거기서 낮은 %로 바꾸면 모터가 멈췄다가 서서히 재시동된다.
+// 최대 duty를 100% 미만으로 캡해 전 구간이 같은 주파수로 스위칭되게 한다. 100이면 캡 비활성.
+// 단, OFF 구간이 너무 짧으면(수백 µs 미만) L9110S가 전환을 못 끝내 과전류 보호가 걸리므로 주파수와 함께 맞춘다.
+const uint8_t DEFAULT_MAX_DUTY_PERCENT = 98;
+const uint8_t MAX_DUTY_MIN_PERCENT = 50;
+
 const unsigned long REQUEST_TIMEOUT_MS = 1000;
 
 // ===== 상태 =====
 uint8_t motorPercent = 0;
+uint32_t pwmFreqHz = DEFAULT_PWM_FREQ_HZ;
+uint8_t maxDutyPercent = DEFAULT_MAX_DUTY_PERCENT;
+
+// MOTOR_PIN은 begin() 이후 GPT 타이머가 잡으므로 digitalWrite/analogWrite를 섞어 쓰지 않는다.
+PwmOut motorPwm(MOTOR_PIN);
 
 WiFiServer server(80);
 
@@ -37,9 +56,13 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
   #state { font-size: 2.4rem; font-weight: bold; margin-bottom: 20px; }
   #state.on { color: #16a34a; }
   #state.off { color: #dc2626; }
-  .presets { display: flex; gap: 8px; justify-content: center; max-width: 480px; margin: 0 auto 20px; }
+  #freq { font-size: 0.95rem; color: #52525b; margin: -12px 0 20px; }
+  h2 { font-size: 1rem; margin: 28px 0 4px; }
+  .hint { font-size: 0.8rem; color: #71717a; margin: 0 0 10px; }
+  .presets { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; max-width: 480px; margin: 0 auto 20px; }
   .presets button { flex: 1; padding: 16px 0; font-size: 1.1rem; font-weight: bold; border: 2px solid #2563eb; border-radius: 12px; background: #fff; color: #2563eb; }
   .presets button.active { background: #2563eb; color: #fff; }
+  .presets.freq button { flex: 1 1 20%; padding: 12px 0; font-size: 1rem; }
   .custom { display: flex; gap: 8px; justify-content: center; max-width: 480px; margin: 0 auto; }
   .custom input { flex: 1; min-width: 0; padding: 14px; font-size: 1.2rem; border: 1px solid #a1a1aa; border-radius: 12px; text-align: center; }
   .custom button { padding: 14px 20px; font-size: 1.1rem; font-weight: bold; border: 0; border-radius: 12px; background: #18181b; color: #fff; }
@@ -48,6 +71,7 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
 <body>
 <h1>Motor Control</h1>
 <div id="state">-</div>
+<div id="freq">-</div>
 <div class="presets" id="presets">
   <button data-p="0">0%</button>
   <button data-p="25">25%</button>
@@ -59,17 +83,66 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
   <input id="customInput" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="0~100">
   <button type="submit">적용</button>
 </form>
+
+<h2>PWM 주파수</h2>
+<p class="hint">낮을수록 100% 근처가 안정되지만 맥동이 커짐. 1 kHz 이상은 안 돎</p>
+<div class="presets freq" id="freqPresets">
+  <button data-hz="20">20</button>
+  <button data-hz="30">30</button>
+  <button data-hz="50">50</button>
+  <button data-hz="75">75</button>
+  <button data-hz="100">100</button>
+  <button data-hz="150">150</button>
+</div>
+<form class="custom" id="freqForm">
+  <input id="freqInput" type="number" min="10" max="30000" step="1" inputmode="numeric" placeholder="10~30000 Hz">
+  <button type="submit">적용</button>
+</form>
+
+<h2>최대 duty (%)</h2>
+<p class="hint">100이면 캡 없음(100% = 상시 HIGH). OFF 구간이 짧아지면 끊김이 생길 수 있음</p>
+<div class="presets freq" id="capPresets">
+  <button data-cap="90">90</button>
+  <button data-cap="95">95</button>
+  <button data-cap="98">98</button>
+  <button data-cap="100">100</button>
+</div>
+<form class="custom" id="capForm">
+  <input id="capInput" type="number" min="50" max="100" step="1" inputmode="numeric" placeholder="50~100">
+  <button type="submit">적용</button>
+</form>
 <script>
   const stateEl = document.getElementById('state');
+  const freqEl = document.getElementById('freq');
   const inputEl = document.getElementById('customInput');
+  const freqInputEl = document.getElementById('freqInput');
+  const capInputEl = document.getElementById('capInput');
   const presetBtns = document.querySelectorAll('#presets button');
+  const freqBtns = document.querySelectorAll('#freqPresets button');
+  const capBtns = document.querySelectorAll('#capPresets button');
 
   function render(s) {
     stateEl.textContent = s.percent + '%';
     stateEl.className = s.percent > 0 ? 'on' : 'off';
+    freqEl.textContent = 'PWM ' + s.freq + ' Hz · 최대 ' + s.cap + '%';
     presetBtns.forEach(b => b.classList.toggle('active', Number(b.dataset.p) === s.percent));
+    freqBtns.forEach(b => b.classList.toggle('active', Number(b.dataset.hz) === s.freq));
+    capBtns.forEach(b => b.classList.toggle('active', Number(b.dataset.cap) === s.cap));
     // 입력 중인 값은 폴링으로 덮어쓰지 않는다.
     if (document.activeElement !== inputEl) inputEl.value = s.percent;
+    if (document.activeElement !== freqInputEl) freqInputEl.value = s.freq;
+    if (document.activeElement !== capInputEl) capInputEl.value = s.cap;
+  }
+
+  // 숫자 입력 폼을 submit 핸들러로 묶는다.
+  function bindForm(formId, input, apply) {
+    document.getElementById(formId).onsubmit = (e) => {
+      e.preventDefault();
+      const n = parseFloat(input.value);
+      if (isNaN(n)) return;
+      input.blur();
+      apply(n);
+    };
   }
 
   function call(path) {
@@ -84,15 +157,23 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
     return call('/set?p=' + n);
   }
 
-  presetBtns.forEach(b => b.onclick = () => setPercent(Number(b.dataset.p)));
+  function setFreq(hz) {
+    hz = Math.round(Math.min(30000, Math.max(10, hz)));
+    return call('/freq?hz=' + hz);
+  }
 
-  document.getElementById('customForm').onsubmit = (e) => {
-    e.preventDefault();
-    const n = parseFloat(inputEl.value);
-    if (isNaN(n)) return;
-    inputEl.blur();
-    setPercent(n);
-  };
+  function setCap(p) {
+    p = Math.round(Math.min(100, Math.max(50, p)));
+    return call('/cap?p=' + p);
+  }
+
+  presetBtns.forEach(b => b.onclick = () => setPercent(Number(b.dataset.p)));
+  freqBtns.forEach(b => b.onclick = () => setFreq(Number(b.dataset.hz)));
+  capBtns.forEach(b => b.onclick = () => setCap(Number(b.dataset.cap)));
+
+  bindForm('customForm', inputEl, setPercent);
+  bindForm('freqForm', freqInputEl, setFreq);
+  bindForm('capForm', capInputEl, setCap);
 
   call('/status');
   setInterval(() => call('/status'), 2000);
@@ -103,11 +184,26 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
 
 // 모터 핀 출력은 이 함수에서만 갱신한다.
 void applyOutput() {
-  analogWrite(MOTOR_PIN, map(motorPercent, 0, 100, 0, 255));
+  motorPwm.pulse_perc(min(motorPercent, maxDutyPercent));
 
   Serial.print("Motor ");
   Serial.print(motorPercent);
   Serial.println("%");
+}
+
+// get_freq_hz()는 타이머 클럭을 돌려주므로 주기 카운트로 나눠야 실제 PWM 주파수가 된다.
+void printPwmFreq() {
+  FspTimer *t = motorPwm.get_timer();
+  Serial.print("PWM ");
+  Serial.print(t->get_freq_hz() / t->get_period_raw());
+  Serial.println(" Hz");
+}
+
+// 주파수를 바꾸면 타이머가 닫혔다 다시 열리므로 duty를 반드시 다시 적용한다.
+void applyFreq() {
+  motorPwm.get_timer()->set_frequency(pwmFreqHz);
+  applyOutput();
+  printPwmFreq();
 }
 
 void sendStatus(WiFiClient &client) {
@@ -118,6 +214,10 @@ void sendStatus(WiFiClient &client) {
   client.println();
   client.print("{\"percent\":");
   client.print(motorPercent);
+  client.print(",\"freq\":");
+  client.print(pwmFreqHz);
+  client.print(",\"cap\":");
+  client.print(maxDutyPercent);
   client.println("}");
 }
 
@@ -185,6 +285,24 @@ void handleRequest(WiFiClient &client, const String &requestLine) {
     motorPercent = constrain(value.toInt(), 0, 100);
     applyOutput();
     sendStatus(client);
+  } else if (path == "/freq") {
+    String value;
+    if (!getQueryParam(query, "hz", value)) {
+      sendNotFound(client);
+      return;
+    }
+    pwmFreqHz = constrain(value.toInt(), (long)PWM_FREQ_MIN_HZ, (long)PWM_FREQ_MAX_HZ);
+    applyFreq();
+    sendStatus(client);
+  } else if (path == "/cap") {
+    String value;
+    if (!getQueryParam(query, "p", value)) {
+      sendNotFound(client);
+      return;
+    }
+    maxDutyPercent = constrain(value.toInt(), (long)MAX_DUTY_MIN_PERCENT, 100L);
+    applyOutput();
+    sendStatus(client);
   } else if (path == "/status") {
     sendStatus(client);
   } else {
@@ -230,6 +348,13 @@ void setup() {
 
   Serial.begin(115200);
   delay(500);
+
+  // duty 0%로 PWM 타이머를 시작한다 (핀이 GPIO에서 GPT 출력으로 전환됨).
+  if (!motorPwm.begin((float)pwmFreqHz, 0.0f)) {
+    Serial.println("PWM init failed");
+    while (true);
+  }
+  printPwmFreq();
 
   if (WiFi.status() == WL_NO_MODULE) {
     Serial.println("WiFi module not found");
