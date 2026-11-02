@@ -5,7 +5,9 @@
 //
 // 배선 (L9110S 채널 A):
 //   D3  → A-IA (PWM)
-//   GND → A-IB (방향 고정)
+//   D4  → A-IB (실행 중 항상 LOW)
+//   ※ A-IB를 GND에 고정하지 않는 이유: 모듈 입력에 VCC 풀업이 있어 부팅·전원 OFF 중 두 입력이
+//     같은 레벨(H/H)이 되어야 모터가 정지한다. GND 고정 시 이 구간에 100%로 돈다.
 //   12V 어댑터 (+) → VCC, (−) → GND  — 어댑터 GND와 Arduino GND 공통 연결 필수
 //   Motor A 단자 → 모터
 
@@ -13,7 +15,8 @@
 #include "arduino_secrets.h"
 
 // ===== 설정 =====
-const uint8_t MOTOR_PIN = 3;
+const uint8_t MOTOR_PIN = 3;  // A-IA, PWM
+const uint8_t DIR_PIN = 4;    // A-IB, 실행 중 항상 LOW
 
 const unsigned long REQUEST_TIMEOUT_MS = 1000;
 
@@ -222,6 +225,8 @@ void setup() {
   // 부팅 직후 모터가 돌지 않도록 가장 먼저 출력을 LOW로 고정한다.
   pinMode(MOTOR_PIN, OUTPUT);
   digitalWrite(MOTOR_PIN, LOW);
+  pinMode(DIR_PIN, OUTPUT);
+  digitalWrite(DIR_PIN, LOW);
 
   Serial.begin(115200);
   delay(500);
