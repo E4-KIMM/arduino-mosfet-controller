@@ -2,8 +2,17 @@
 //
 // 보드가 WiFi 핫스팟을 만들고, 접속한 브라우저에서 http://192.168.4.1 로 모터 출력(0~100%)을 제어한다.
 // 출력은 PWM duty로 조절한다 (50% ≈ 평균 6V @ 12V 전원).
-// PWM 주파수(기본 150 Hz)와 최대 duty(기본 98%)는 웹에서 조절할 수 있다. 실측 결과 L9110S는 1 kHz 이상에서
+// PWM 주파수(기본 150 Hz)와 최대 duty(기본 100%)는 웹에서 조절할 수 있다. 실측 결과 L9110S는 1 kHz 이상에서
 // 스위칭을 못 따라가 모터가 돌지 않고, 100~200 Hz에서 가장 잘 돈다. 최대 duty 캡의 이유는 아래 주석 참고.
+//
+// 단계 프리셋 (SC3802PM-A 에어펌프 실측, 2026-11-02, 출력 낮은 순). 압력(Pa)은 설치 조건에 따라
+// 달라지므로 기록하지 않는다. 모터/드라이버가 바뀌면 재튜닝 필요.
+//   6단 : 100%            (상시 HIGH, 주파수 무관)
+//   5단 :  99% /  500 Hz
+//   4단 :  75% /   30 Hz
+//   3단 :  50% /   30 Hz
+//   2단 :  75% /  150 Hz
+//   1단 :  50% /  150 Hz
 //
 // 배선 (L9110S 채널 A):
 //   D3  → A-IA (PWM)
@@ -29,7 +38,7 @@ const uint32_t PWM_FREQ_MAX_HZ = 30000;
 // 100% duty는 스위칭 없는 상시 HIGH가 되어, 거기서 낮은 %로 바꾸면 모터가 멈췄다가 서서히 재시동된다.
 // 최대 duty를 100% 미만으로 캡해 전 구간이 같은 주파수로 스위칭되게 한다. 100이면 캡 비활성.
 // 단, OFF 구간이 너무 짧으면(수백 µs 미만) L9110S가 전환을 못 끝내 과전류 보호가 걸리므로 주파수와 함께 맞춘다.
-const uint8_t DEFAULT_MAX_DUTY_PERCENT = 98;
+const uint8_t DEFAULT_MAX_DUTY_PERCENT = 100;
 const uint8_t MAX_DUTY_MIN_PERCENT = 50;
 
 const unsigned long REQUEST_TIMEOUT_MS = 1000;
@@ -63,6 +72,8 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
   .presets button { flex: 1; padding: 16px 0; font-size: 1.1rem; font-weight: bold; border: 2px solid #2563eb; border-radius: 12px; background: #fff; color: #2563eb; }
   .presets button.active { background: #2563eb; color: #fff; }
   .presets.freq button { flex: 1 1 20%; padding: 12px 0; font-size: 1rem; }
+  .presets.pa button { flex: 1 1 28%; padding: 10px 0; line-height: 1.3; }
+  .presets.pa small { display: block; font-size: 0.75rem; font-weight: normal; opacity: 0.8; }
   .custom { display: flex; gap: 8px; justify-content: center; max-width: 480px; margin: 0 auto; }
   .custom input { flex: 1; min-width: 0; padding: 14px; font-size: 1.2rem; border: 1px solid #a1a1aa; border-radius: 12px; text-align: center; }
   .custom button { padding: 14px 20px; font-size: 1.1rem; font-weight: bold; border: 0; border-radius: 12px; background: #18181b; color: #fff; }
@@ -83,6 +94,10 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
   <input id="customInput" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="0~100">
   <button type="submit">적용</button>
 </form>
+
+<h2>단계 프리셋</h2>
+<p class="hint">출력과 주파수를 함께 적용 (실측 튜닝값)</p>
+<div class="presets pa" id="paPresets"></div>
 
 <h2>PWM 주파수</h2>
 <p class="hint">낮을수록 100% 근처가 안정되지만 맥동이 커짐. 1 kHz 이상은 안 돎</p>
@@ -121,6 +136,24 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
   const freqBtns = document.querySelectorAll('#freqPresets button');
   const capBtns = document.querySelectorAll('#capPresets button');
 
+  // 실측 단계 프리셋 (출력 낮은 순). hz 가 없으면 주파수는 바꾸지 않는다 (100% = 상시 HIGH라 무관).
+  const PA_PRESETS = [
+    { p: 50,  hz: 150 },
+    { p: 75,  hz: 150 },
+    { p: 50,  hz: 30 },
+    { p: 75,  hz: 30 },
+    { p: 99,  hz: 500 },
+    { p: 100 },
+  ];
+  const paBox = document.getElementById('paPresets');
+  const paBtns = PA_PRESETS.map((pr, i) => {
+    const b = document.createElement('button');
+    b.innerHTML = (i + 1) + '단<small>' + pr.p + '%' + (pr.hz ? ' · ' + pr.hz + ' Hz' : '') + '</small>';
+    b.onclick = () => call('/set?p=' + pr.p + '&cap=100' + (pr.hz ? '&hz=' + pr.hz : ''));
+    paBox.appendChild(b);
+    return b;
+  });
+
   function render(s) {
     stateEl.textContent = s.percent + '%';
     stateEl.className = s.percent > 0 ? 'on' : 'off';
@@ -128,6 +161,10 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
     presetBtns.forEach(b => b.classList.toggle('active', Number(b.dataset.p) === s.percent));
     freqBtns.forEach(b => b.classList.toggle('active', Number(b.dataset.hz) === s.freq));
     capBtns.forEach(b => b.classList.toggle('active', Number(b.dataset.cap) === s.cap));
+    paBtns.forEach((b, i) => {
+      const pr = PA_PRESETS[i];
+      b.classList.toggle('active', pr.p === s.percent && (!pr.hz || pr.hz === s.freq));
+    });
     // 입력 중인 값은 폴링으로 덮어쓰지 않는다.
     if (document.activeElement !== inputEl) inputEl.value = s.percent;
     if (document.activeElement !== freqInputEl) freqInputEl.value = s.freq;
@@ -277,13 +314,22 @@ void handleRequest(WiFiClient &client, const String &requestLine) {
   if (path == "/") {
     sendPage(client);
   } else if (path == "/set") {
+    // p 는 필수, hz / cap 은 선택. 프리셋처럼 셋을 한 요청으로 함께 바꿀 수 있다.
     String value;
     if (!getQueryParam(query, "p", value)) {
       sendNotFound(client);
       return;
     }
     motorPercent = constrain(value.toInt(), 0, 100);
-    applyOutput();
+    if (getQueryParam(query, "cap", value)) {
+      maxDutyPercent = constrain(value.toInt(), (long)MAX_DUTY_MIN_PERCENT, 100L);
+    }
+    if (getQueryParam(query, "hz", value)) {
+      pwmFreqHz = constrain(value.toInt(), (long)PWM_FREQ_MIN_HZ, (long)PWM_FREQ_MAX_HZ);
+      applyFreq();
+    } else {
+      applyOutput();
+    }
     sendStatus(client);
   } else if (path == "/freq") {
     String value;
