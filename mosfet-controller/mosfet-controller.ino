@@ -1,7 +1,13 @@
-// Arduino Uno R4 WiFi — 웹(AP) 기반 MOSFET 모터 제어
+// Arduino Uno R4 WiFi — 웹(AP) 기반 모터 출력 제어 (L9110S)
 //
-// 보드가 WiFi 핫스팟을 만들고, 접속한 브라우저에서 http://192.168.4.1 로 모터를 제어한다.
-// D3 → HW-548 MOSFET 모듈 신호 입력 (GND 공통 연결 필수, 모터 양단 플라이백 다이오드 권장)
+// 보드가 WiFi 핫스팟을 만들고, 접속한 브라우저에서 http://192.168.4.1 로 모터 출력(0~100%)을 제어한다.
+// 출력은 PWM duty로 조절한다 (50% ≈ 평균 6V @ 12V 전원).
+//
+// 배선 (L9110S 채널 A):
+//   D3  → A-IA (PWM)
+//   GND → A-IB (방향 고정)
+//   12V 어댑터 (+) → VCC, (−) → GND  — 어댑터 GND와 Arduino GND 공통 연결 필수
+//   Motor A 단자 → 모터
 
 #include <WiFiS3.h>
 #include "arduino_secrets.h"
@@ -12,7 +18,7 @@ const uint8_t MOTOR_PIN = 3;
 const unsigned long REQUEST_TIMEOUT_MS = 1000;
 
 // ===== 상태 =====
-bool motorOn = false;
+uint8_t motorPercent = 0;
 
 WiFiServer server(80);
 
@@ -25,28 +31,42 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
 <style>
   body { font-family: sans-serif; margin: 0; padding: 24px 16px; background: #f4f4f5; color: #18181b; text-align: center; }
   h1 { font-size: 1.4rem; margin: 0 0 16px; }
-  #state { font-size: 1.2rem; font-weight: bold; margin-bottom: 20px; }
+  #state { font-size: 2.4rem; font-weight: bold; margin-bottom: 20px; }
   #state.on { color: #16a34a; }
   #state.off { color: #dc2626; }
-  .buttons { display: flex; gap: 12px; justify-content: center; }
-  button { flex: 1; max-width: 160px; padding: 20px 0; font-size: 1.3rem; font-weight: bold; border: 0; border-radius: 12px; color: #fff; }
-  #btnOn { background: #16a34a; }
-  #btnOff { background: #dc2626; }
+  .presets { display: flex; gap: 8px; justify-content: center; max-width: 480px; margin: 0 auto 20px; }
+  .presets button { flex: 1; padding: 16px 0; font-size: 1.1rem; font-weight: bold; border: 2px solid #2563eb; border-radius: 12px; background: #fff; color: #2563eb; }
+  .presets button.active { background: #2563eb; color: #fff; }
+  .custom { display: flex; gap: 8px; justify-content: center; max-width: 480px; margin: 0 auto; }
+  .custom input { flex: 1; min-width: 0; padding: 14px; font-size: 1.2rem; border: 1px solid #a1a1aa; border-radius: 12px; text-align: center; }
+  .custom button { padding: 14px 20px; font-size: 1.1rem; font-weight: bold; border: 0; border-radius: 12px; background: #18181b; color: #fff; }
 </style>
 </head>
 <body>
 <h1>Motor Control</h1>
 <div id="state">-</div>
-<div class="buttons">
-  <button id="btnOn">ON</button>
-  <button id="btnOff">OFF</button>
+<div class="presets" id="presets">
+  <button data-p="0">0%</button>
+  <button data-p="25">25%</button>
+  <button data-p="50">50%</button>
+  <button data-p="75">75%</button>
+  <button data-p="100">100%</button>
 </div>
+<form class="custom" id="customForm">
+  <input id="customInput" type="number" min="0" max="100" step="1" inputmode="numeric" placeholder="0~100">
+  <button type="submit">적용</button>
+</form>
 <script>
   const stateEl = document.getElementById('state');
+  const inputEl = document.getElementById('customInput');
+  const presetBtns = document.querySelectorAll('#presets button');
 
   function render(s) {
-    stateEl.textContent = s.on ? 'ON' : 'OFF';
-    stateEl.className = s.on ? 'on' : 'off';
+    stateEl.textContent = s.percent + '%';
+    stateEl.className = s.percent > 0 ? 'on' : 'off';
+    presetBtns.forEach(b => b.classList.toggle('active', Number(b.dataset.p) === s.percent));
+    // 입력 중인 값은 폴링으로 덮어쓰지 않는다.
+    if (document.activeElement !== inputEl) inputEl.value = s.percent;
   }
 
   function call(path) {
@@ -56,8 +76,20 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
     });
   }
 
-  document.getElementById('btnOn').onclick = () => call('/on');
-  document.getElementById('btnOff').onclick = () => call('/off');
+  function setPercent(n) {
+    n = Math.round(Math.min(100, Math.max(0, n)));
+    return call('/set?p=' + n);
+  }
+
+  presetBtns.forEach(b => b.onclick = () => setPercent(Number(b.dataset.p)));
+
+  document.getElementById('customForm').onsubmit = (e) => {
+    e.preventDefault();
+    const n = parseFloat(inputEl.value);
+    if (isNaN(n)) return;
+    inputEl.blur();
+    setPercent(n);
+  };
 
   call('/status');
   setInterval(() => call('/status'), 2000);
@@ -68,10 +100,11 @@ const char PAGE_HTML[] = R"rawliteral(<!DOCTYPE html>
 
 // 모터 핀 출력은 이 함수에서만 갱신한다.
 void applyOutput() {
-  digitalWrite(MOTOR_PIN, motorOn ? HIGH : LOW);
+  analogWrite(MOTOR_PIN, map(motorPercent, 0, 100, 0, 255));
 
   Serial.print("Motor ");
-  Serial.println(motorOn ? "ON" : "OFF");
+  Serial.print(motorPercent);
+  Serial.println("%");
 }
 
 void sendStatus(WiFiClient &client) {
@@ -80,8 +113,8 @@ void sendStatus(WiFiClient &client) {
   client.println("Cache-Control: no-store");
   client.println("Connection: close");
   client.println();
-  client.print("{\"on\":");
-  client.print(motorOn ? "true" : "false");
+  client.print("{\"percent\":");
+  client.print(motorPercent);
   client.println("}");
 }
 
@@ -110,6 +143,23 @@ String extractTarget(const String &requestLine) {
   return requestLine.substring(start + 1, end);
 }
 
+// "a=1&p=50" 같은 query 에서 key 의 값을 꺼낸다. 없으면 false.
+bool getQueryParam(const String &query, const String &key, String &value) {
+  String prefix = key + "=";
+  int pos = 0;
+  while (pos <= (int)query.length()) {
+    int amp = query.indexOf('&', pos);
+    if (amp < 0) amp = query.length();
+    String pair = query.substring(pos, amp);
+    if (pair.startsWith(prefix)) {
+      value = pair.substring(prefix.length());
+      return true;
+    }
+    pos = amp + 1;
+  }
+  return false;
+}
+
 void handleRequest(WiFiClient &client, const String &requestLine) {
   if (!requestLine.startsWith("GET ")) {
     sendNotFound(client);
@@ -119,15 +169,17 @@ void handleRequest(WiFiClient &client, const String &requestLine) {
   String target = extractTarget(requestLine);
   int q = target.indexOf('?');
   String path = q >= 0 ? target.substring(0, q) : target;
+  String query = q >= 0 ? target.substring(q + 1) : "";
 
   if (path == "/") {
     sendPage(client);
-  } else if (path == "/on") {
-    motorOn = true;
-    applyOutput();
-    sendStatus(client);
-  } else if (path == "/off") {
-    motorOn = false;
+  } else if (path == "/set") {
+    String value;
+    if (!getQueryParam(query, "p", value)) {
+      sendNotFound(client);
+      return;
+    }
+    motorPercent = constrain(value.toInt(), 0, 100);
     applyOutput();
     sendStatus(client);
   } else if (path == "/status") {
